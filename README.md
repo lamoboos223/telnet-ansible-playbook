@@ -34,7 +34,7 @@ make              # everything
 make comm         # one stream, both sites
 make comm ruh     # one stream, one site (scoped DR run)
 make ruh          # one site, all streams
-make comm ruh INVENTORY=other.ini
+make comm ruh INVENTORY=other.ini # for auth credentials
 ```
 
 Streams: `core comm sc gov`. Sites: `ruh jed`. Or call the playbook directly:
