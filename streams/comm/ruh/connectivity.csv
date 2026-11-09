@@ -1,0 +1,2 @@
+source,destination,port
+comm-app01,REDIS01,6379

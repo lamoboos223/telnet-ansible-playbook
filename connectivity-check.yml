@@ -1,0 +1,163 @@
+---
+- name: Load stream CSVs and group source hosts
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Optional filters for a scoped DR run: -e stream=comm -e site=ruh
+    stream: ""
+    site: ""
+  tasks:
+    - name: Find connectivity CSVs under streams/
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/streams"
+        patterns: connectivity.csv
+        recurse: true
+      register: csv_files
+
+    - name: Read each CSV
+      community.general.read_csv:
+        path: "{{ item.path }}"
+      loop: "{{ csv_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: csvs
+
+    - name: Build row list tagged with stream and site
+      ansible.builtin.set_fact:
+        all_rows: >-
+          {%- set rows = [] -%}
+          {%- for res in csvs.results -%}
+            {%- set parts = res.item.path.split('/') -%}
+            {%- set st = parts[-3] -%}
+            {%- set si = parts[-2] -%}
+            {%- if (stream == '' or stream == st) and (site == '' or site == si) -%}
+              {%- for r in res.list -%}
+                {%- set _ = rows.append(r | combine({'stream': st, 'site': si})) -%}
+              {%- endfor -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ rows }}
+
+    - name: Add each unique source to the check group with its rows
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: connectivity_sources
+        check_rows: "{{ all_rows | selectattr('source', 'eq', item) | list }}"
+      loop: "{{ all_rows | map(attribute='source') | unique | list }}"
+      changed_when: false
+
+- name: Try each source as Windows over WinRM
+  hosts: connectivity_sources
+  gather_facts: false
+  vars:
+    ansible_connection: winrm
+    ansible_winrm_connection_timeout: 10
+  tasks:
+    - name: Test TCP connectivity (PowerShell)
+      ansible.windows.win_shell: |
+        $targets = @(
+        {% for row in check_rows %}
+          @{ destination = '{{ row.destination }}'; port = {{ row.port | int }} }
+        {% endfor %}
+        )
+        $results = foreach ($t in $targets) {
+          $c = New-Object System.Net.Sockets.TcpClient
+          $ok = $false
+          try {
+            $ar = $c.BeginConnect($t.destination, $t.port, $null, $null)
+            if ($ar.AsyncWaitHandle.WaitOne(5000) -and $c.Connected) { $ok = $true }
+          } catch {}
+          $c.Close()
+          @{ destination = $t.destination; port = $t.port; reachable = $ok }
+        }
+        ConvertTo-Json -InputObject @($results) -Compress
+      register: tcp_check_win
+      ignore_unreachable: true
+      failed_when: false
+      changed_when: false
+
+- name: Retry unreachable sources as Linux over SSH
+  hosts: connectivity_sources
+  gather_facts: false
+  vars:
+    ansible_connection: ssh
+    ansible_port: "{{ ssh_port | default(22) }}"
+  tasks:
+    - name: Test TCP connectivity (bash)
+      ansible.builtin.shell: |
+        targets=()
+        {% for row in check_rows %}
+        targets+=('{{ row.destination }} {{ row.port | int }}')
+        {% endfor %}
+        out="["; sep=""
+        for t in "${targets[@]}"; do
+          set -- $t
+          if timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; then ok=true; else ok=false; fi
+          out+="$sep{\"destination\":\"$1\",\"port\":$2,\"reachable\":$ok}"
+          sep=","
+        done
+        echo "$out]"
+      args:
+        executable: /bin/bash
+      when: (tcp_check_win.stdout | default('')).strip() is not match('^\[')
+      register: tcp_check_ssh
+      ignore_unreachable: true
+      failed_when: false
+      changed_when: false
+
+- name: Report
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Collect results from all sources
+      ansible.builtin.set_fact:
+        report_rows: >-
+          {%- set rows = [] -%}
+          {%- for src in groups['connectivity_sources'] | default([]) -%}
+            {%- set win = hostvars[src].tcp_check_win | default({}) -%}
+            {%- set ssh = hostvars[src].tcp_check_ssh | default({}) -%}
+            {%- set res = win if (win.stdout | default('')).strip().startswith('[')
+                          else (ssh if (ssh.stdout | default('')).strip().startswith('[') else {}) -%}
+            {%- set checks = (res.stdout | from_json) if res.stdout is defined else [] -%}
+            {%- for r in hostvars[src].check_rows -%}
+              {%- if res.stdout is defined -%}
+                {%- set hit = checks | selectattr('destination', 'eq', r.destination)
+                                     | selectattr('port', 'eq', r.port | int) | list | first -%}
+                {%- set _ = rows.append({'stream': r.stream, 'site': r.site, 'source': src,
+                                         'destination': r.destination, 'port': r.port | int,
+                                         'reachable': hit.reachable | bool, 'note': ''}) -%}
+              {%- else -%}
+                {%- set _ = rows.append({'stream': r.stream, 'site': r.site, 'source': src,
+                                         'destination': r.destination, 'port': r.port | int,
+                                         'reachable': false,
+                                         'note': 'WinRM: ' ~ (win.msg | default('failed')) ~
+                                                 ' / SSH: ' ~ (ssh.msg | default('failed'))}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ rows }}
+
+    - name: Print connectivity table
+      ansible.builtin.debug:
+        msg: "{{ [header] + body + [''] + ['True: ' ~ (true_count), 'False: ' ~ (sorted_rows | length - true_count)] + conn_failures }}"
+      vars:
+        sorted_rows: >-
+          {{ report_rows | sort(attribute='port') | sort(attribute='destination')
+                         | sort(attribute='source') | sort(attribute='site') | sort(attribute='stream') }}
+        header: "{{ '%-8s %-6s %-22s %-38s %-6s %-9s' | format('Stream', 'Site', 'Source', 'Destination', 'Port', 'Reachable') }}"
+        body: >-
+          {%- set lines = [] -%}
+          {%- for r in sorted_rows -%}
+            {%- set _ = lines.append('%-8s %-6s %-22s %-38s %-6s %-9s'
+               | format(r.stream, r.site, r.source, r.destination, r.port, r.reachable)) -%}
+          {%- endfor -%}
+          {{ lines }}
+        true_count: "{{ sorted_rows | selectattr('reachable') | list | length | int }}"
+        conn_failures: >-
+          {%- set notes = sorted_rows | selectattr('note', 'ne', '') | map(attribute='source') | unique | list -%}
+          {%- set lines = [] -%}
+          {%- for src in notes -%}
+            {%- set msg = (sorted_rows | selectattr('source', 'eq', src) | map(attribute='note') | first) -%}
+            {%- set _ = lines.append('Connection failed on ' ~ src ~ ': ' ~ msg) -%}
+          {%- endfor -%}
+          {{ lines }}
